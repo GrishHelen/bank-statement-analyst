@@ -1,5 +1,7 @@
 # Application and test dependencies.
 gigachat==0.2.4
+openai==3.51.0
+pydantic==2.14.3
 python-dotenv==1.2.4
 httpx==0.28.1
 certifi==2026.10.23

@@ -1,43 +1,34 @@
-"""Подключение к GigaChat и преобразование ответа SDK в текст."""
+"""Подключение к GigaChat: преобразование сообщений и вызовов функций в формат SDK."""
 
-import ssl
+import json
 from types import TracebackType
+from typing import Any
 
-import certifi
 import httpx
 from gigachat import GigaChat
 from gigachat.exceptions import GigaChatException, ResponseError
 from gigachat.models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatContentPart,
+    ChatFunctionResult,
+    ChatFunctionSpecification,
     ChatMessage,
     ChatModelOptions,
+    ChatTool,
     ChatToolConfig,
 )
+from gigachat.models.chat_completions import ChatFunctionCall
 
-from src.chat import ChatError, Message, Reply
+from src.chat import ChatError, Message, Reply, ToolCall
 from src.config import Settings
-
-
-API_ERRORS: dict[int, str] = {
-    400: "Сервис отклонил запрос. Сократите сообщение или очистите историю командой /reset.",
-    401: "Ошибка авторизации. Проверьте GIGACHAT_CREDENTIALS и GIGACHAT_SCOPE.",
-    403: "Доступ запрещён. Проверьте права проекта, доступ к модели и остаток квоты.",
-    404: "Модель или адрес API не найдены. Проверьте GIGACHAT_MODEL и GIGACHAT_BASE_URL.",
-    413: "Слишком большой запрос. Сократите сообщение или используйте /reset.",
-    422: "Сервис не принял параметры запроса. Проверьте настройки модели.",
-    429: "Достигнут лимит запросов или квота GigaChat. Проверьте кабинет и повторите позже.",
-}
+from src.providers.common import API_ERRORS, build_ssl_context
 
 
 class GigaChatModel:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         try:
-            context = ssl.create_default_context()
-            context.load_verify_locations(certifi.where())
-            if settings.ca_bundle_file:
-                context.load_verify_locations(str(settings.ca_bundle_file))
             self.client = GigaChat(
                 credentials=settings.credentials,
                 scope=settings.scope,
@@ -45,7 +36,7 @@ class GigaChatModel:
                 base_url=settings.base_url,
                 auth_url=settings.auth_url,
                 timeout=settings.timeout,
-                ssl_context=context,
+                ssl_context=build_ssl_context(settings.ca_bundle_file),
                 verify_ssl_certs=True,
                 max_retries=0,
             )
@@ -63,16 +54,26 @@ class GigaChatModel:
     ) -> None:
         self.client.close()
 
-    def complete(self, messages: list[Message]) -> Reply:
+    def complete(self, messages: list[Message], tools: list[dict[str, Any]] | None = None) -> Reply:
         request = ChatCompletionRequest(
             model=self.settings.model,
-            messages=[ChatMessage(role=message.role, content=message.content) for message in messages],
+            messages=to_gigachat_messages(messages),
             model_options=ChatModelOptions(
                 max_tokens=self.settings.max_tokens,
                 temperature=self.settings.temperature,
             ),
-            tool_config=ChatToolConfig(mode="none"),
+            tool_config=ChatToolConfig(mode="auto" if tools else "none"),
         )
+        if tools:
+            request.tools = [ChatTool(functions={"specifications": [
+                ChatFunctionSpecification(
+                    name=tool["name"],
+                    description=tool["description"],
+                    parameters=tool["parameters"],
+                    few_shot_examples=tool.get("examples") or None,
+                )
+                for tool in tools
+            ]})]
         try:
             response = self.client.chat.create(request)
         except httpx.TimeoutException as exc:
@@ -91,25 +92,60 @@ class GigaChatModel:
         return parse_reply(response)
 
 
+def to_gigachat_messages(messages: list[Message]) -> list[ChatMessage]:
+    """Результаты инструментов одного шага объединяются в одно сообщение role=tool."""
+    result: list[ChatMessage] = []
+    for message in messages:
+        if message.role == "tool":
+            part = ChatContentPart(function_result=ChatFunctionResult(
+                id_=message.tool_call_id, name=message.name or "", result=json.loads(message.content),
+            ))
+            previous = result[-1] if result else None
+            if previous is not None and previous.role == "tool" and previous.tools_state_id == message.state:
+                previous.content = (previous.content or []) + [part]
+            else:
+                result.append(ChatMessage(role="tool", tools_state_id=message.state, content=[part]))
+        elif message.tool_calls:
+            parts = [ChatContentPart(text=message.content)] if message.content else []
+            for call in message.tool_calls:
+                parts.append(ChatContentPart(function_call=ChatFunctionCall(
+                    id_=call.id, name=call.name, arguments=call.arguments,
+                )))
+            result.append(ChatMessage(role="assistant", tools_state_id=message.state, content=parts))
+        else:
+            result.append(ChatMessage(role=message.role, content=message.content))
+    return result
+
+
 def parse_reply(response: ChatCompletionResponse) -> Reply:
-    """Собрать текст ответа и проверить, не прервалась ли генерация."""
+    """Собрать текст и вызовы функций; проверить, не прервалась ли генерация."""
     if response.error_details:
         raise ChatError("GigaChat сообщил об ошибке генерации. Попробуйте позже.")
 
     parts: list[str] = []
+    calls: list[ToolCall] = []
+    state: str | None = None
     truncated = response.finish_reason == "length"
     for message in response.messages:
-        if message.function_call:
-            raise ChatError("Модель запросила инструмент, но в этой версии доступны только текстовые ответы.")
+        if message.role != "assistant":
+            continue
         if message.finish_reason == "length":
             truncated = True
+        if message.tools_state_id:
+            state = message.tools_state_id
+        if message.function_call:
+            calls.append(to_tool_call(message.function_call))
         for part in message.content or []:
             if part.function_call:
-                raise ChatError("Модель запросила инструмент, но в этой версии доступны только текстовые ответы.")
-            if message.role == "assistant" and part.text:
+                calls.append(to_tool_call(part.function_call))
+            elif part.text:
                 parts.append(part.text)
 
     text = "\n".join(parts).strip()
-    if not text:
+    if not text and not calls:
         raise ChatError("Модель вернула пустой ответ.")
-    return Reply(text, truncated=truncated)
+    return Reply(text, truncated=truncated, tool_calls=tuple(calls), state=state)
+
+
+def to_tool_call(call: ChatFunctionCall) -> ToolCall:
+    return ToolCall(id=call.id_, name=call.name, arguments=call.arguments)
