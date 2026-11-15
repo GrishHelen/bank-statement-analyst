@@ -12,9 +12,18 @@ class ConfigurationError(Exception):
     """Ошибка в настройках без вывода ключей и токенов."""
 
 
+PROVIDERS: tuple[str, ...] = ("gigachat", "openai")
+LOCAL_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
 @dataclass(frozen=True)
 class Settings:
-    credentials: str = field(repr=False)
+    credentials: str = field(default="", repr=False)
+    provider: str = "gigachat"
+    openai_api_key: str = field(default="", repr=False)
+    openai_base_url: str = ""
+    openai_model: str = ""
+    max_agent_steps: int = 5
     scope: str = "GIGACHAT_API_PERS"
     model: str = "GigaChat-2"
     base_url: str = "https://api.giga.chat/v1/"
@@ -57,27 +66,25 @@ def load_settings(env_file: Path) -> Settings:
             raise ConfigurationError(f"{name} должен быть в диапазоне {low:g}–{high:g}.")
         return parsed
 
+    provider = value("LLM_PROVIDER", "gigachat").lower()
+    if provider not in PROVIDERS:
+        raise ConfigurationError("LLM_PROVIDER должен быть gigachat или openai.")
     credentials = value("GIGACHAT_CREDENTIALS")
-    if not credentials or credentials.startswith("<"):
+    if provider == "gigachat" and (not credentials or credentials.startswith("<")):
         raise ConfigurationError("Заполните GIGACHAT_CREDENTIALS в локальном .env.")
     scope = value("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
     if scope not in {"GIGACHAT_API_PERS", "GIGACHAT_API_B2B", "GIGACHAT_API_CORP"}:
         raise ConfigurationError("Неизвестное значение GIGACHAT_SCOPE.")
     base_url = value("GIGACHAT_BASE_URL", Settings.base_url)
     auth_url = value("GIGACHAT_AUTH_URL", Settings.auth_url)
-    for name, url in (("GIGACHAT_BASE_URL", base_url), ("GIGACHAT_AUTH_URL", auth_url)):
-        try:
-            parsed = urlsplit(url)
-            valid = (
-                parsed.scheme == "https"
-                and bool(parsed.hostname)
-                and parsed.username is None
-                and parsed.password is None
-            )
-        except ValueError:
-            valid = False
-        if not valid:
-            raise ConfigurationError(f"{name} должен содержать HTTPS-адрес без учётных данных.")
+    check_url("GIGACHAT_BASE_URL", base_url)
+    check_url("GIGACHAT_AUTH_URL", auth_url)
+    openai_base_url = value("OPENAI_BASE_URL")
+    openai_model = value("OPENAI_MODEL")
+    if provider == "openai":
+        if not openai_base_url or not openai_model:
+            raise ConfigurationError("Для LLM_PROVIDER=openai заполните OPENAI_BASE_URL и OPENAI_MODEL.")
+        check_url("OPENAI_BASE_URL", openai_base_url, allow_local_http=True)
     ca_path = value("GIGACHAT_CA_BUNDLE_FILE")
     ca_bundle: Path | None = None
     if ca_path:
@@ -89,6 +96,11 @@ def load_settings(env_file: Path) -> Settings:
         ca_bundle = ca_bundle.resolve()
     return Settings(
         credentials=credentials,
+        provider=provider,
+        openai_api_key=value("OPENAI_API_KEY"),
+        openai_base_url=openai_base_url,
+        openai_model=openai_model,
+        max_agent_steps=integer("APP_MAX_AGENT_STEPS", 5, 1, 10),
         scope=scope,
         model=value("GIGACHAT_MODEL", Settings.model),
         base_url=base_url,
@@ -100,3 +112,20 @@ def load_settings(env_file: Path) -> Settings:
         max_history_turns=integer("APP_MAX_HISTORY_TURNS", 5, 1, 50),
         max_input_chars=integer("APP_MAX_INPUT_CHARS", 4000, 1, 16000),
     )
+
+
+def check_url(name: str, url: str, allow_local_http: bool = False) -> None:
+    """HTTPS без учётных данных в адресе; HTTP разрешён только для локальной модели."""
+    try:
+        parsed = urlsplit(url)
+        local_http = allow_local_http and parsed.scheme == "http" and parsed.hostname in LOCAL_HOSTS
+        valid = (
+            (parsed.scheme == "https" or local_http)
+            and bool(parsed.hostname)
+            and parsed.username is None
+            and parsed.password is None
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ConfigurationError(f"{name} должен содержать HTTPS-адрес без учётных данных.")

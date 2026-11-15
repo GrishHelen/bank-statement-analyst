@@ -9,7 +9,7 @@ class FakeModel:
         self.requests: list[tuple[Message, ...]] = []
         self.error: ChatError | None = None
 
-    def complete(self, messages: list[Message]) -> Reply:
+    def complete(self, messages: list[Message], tools: list[dict] | None = None) -> Reply:
         self.requests.append(tuple(messages))
         if self.error:
             raise self.error

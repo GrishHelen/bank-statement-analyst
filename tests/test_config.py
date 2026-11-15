@@ -9,7 +9,7 @@ from src.config import ConfigurationError, load_settings
 @pytest.fixture(autouse=True)
 def clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in list(os.environ):
-        if name.startswith(("GIGACHAT_", "APP_MAX_")):
+        if name.startswith(("GIGACHAT_", "APP_MAX_", "LLM_", "OPENAI_")):
             monkeypatch.delenv(name)
 
 

@@ -7,7 +7,7 @@ from gigachat.exceptions import ResponseError
 from gigachat.models import ChatCompletionResponse, ChatContentPart, ChatMessage
 from gigachat.models.chat_completions import ChatFunctionCall
 
-from src.chat import ChatError, Message
+from src.chat import ChatError, Message, ToolCall
 from src.cli import main
 from src.config import Settings
 from src.providers.gigachat import GigaChatModel, parse_reply
@@ -80,14 +80,38 @@ def test_reply_joins_assistant_text_and_keeps_truncation() -> None:
 
 
 @pytest.mark.parametrize("nested", [False, True])
-def test_unexpected_tool_call_is_rejected(nested: bool) -> None:
-    call = ChatFunctionCall(name="test_tool", arguments={})
+def test_tool_call_is_parsed_from_both_formats(nested: bool) -> None:
+    call = ChatFunctionCall(id="call-1", name="test_tool", arguments={"limit": 3})
     if nested:
-        message = ChatMessage(role="assistant", content=[ChatContentPart(function_call=call)])
+        message = ChatMessage(role="assistant", content=[ChatContentPart(function_call=call)],
+                              tools_state_id="state-1")
     else:
-        message = ChatMessage(role="assistant", function_call=call)
-    with pytest.raises(ChatError, match="инструмент"):
-        parse_reply(ChatCompletionResponse(messages=[message]))
+        message = ChatMessage(role="assistant", function_call=call, tools_state_id="state-1")
+    reply = parse_reply(ChatCompletionResponse(messages=[message]))
+    assert reply.tool_calls == (ToolCall("call-1", "test_tool", {"limit": 3}),)
+    assert reply.state == "state-1"
+
+
+def test_adapter_sends_tools_and_returns_results_with_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider, client, _ = make_provider(monkeypatch)
+    client.chat.create.return_value = ChatCompletionResponse(
+        messages=[ChatMessage(role="assistant", content="Итого 100 ₽")]
+    )
+    tool = {"name": "spending_summary", "description": "Сумма", "examples": [],
+            "parameters": {"type": "object", "properties": {}}}
+    history = [
+        Message("user", "Сколько?"),
+        Message("assistant", "", tool_calls=(ToolCall("c1", "spending_summary", {}),), state="s1"),
+        Message("tool", '{"ok": true}', tool_call_id="c1", name="spending_summary", state="s1"),
+    ]
+    provider.complete(history, [tool])
+    request = client.chat.create.call_args.args[0]
+    assert request.tool_config.mode == "auto"
+    assert request.tools[0].functions.specifications[0].name == "spending_summary"
+    assistant, result = request.messages[1], request.messages[2]
+    assert assistant.tools_state_id == "s1" and assistant.content[0].function_call.name == "spending_summary"
+    assert result.role == "tool" and result.tools_state_id == "s1"
+    assert result.content[0].function_result.result == {"ok": True}
 
 
 def test_single_message_runs_through_chat_and_mock_client(
@@ -101,6 +125,7 @@ def test_single_message_runs_through_chat_and_mock_client(
     client.chat.create.return_value = ChatCompletionResponse(
         messages=[ChatMessage(role="assistant", content="Тестовый ответ")],
     )
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("src.providers.gigachat.GigaChat", Mock(return_value=client))
 
     assert main(["--env-file", str(env), "--message", "Тестовый вопрос"]) == 0
